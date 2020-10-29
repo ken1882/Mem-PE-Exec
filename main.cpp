@@ -9,6 +9,8 @@ std::fstream SourceFile;
 
 void parseHeader32();
 void parseHeader64();
+void applyRelocation32();
+void applyRelocation64();
 void parseImport32();
 void parseImport64();
 
@@ -43,6 +45,7 @@ int main(int argc, char* argv[], char** envp){
             std::cout << "New image base is: " << (void*)newImagebase << '\n';
         }
         parseHeader64();
+        applyRelocation64();
         parseImport64();
     }
     else{ // x86 header
@@ -60,6 +63,7 @@ int main(int argc, char* argv[], char** envp){
             std::cout << "New image base is: " << (void*)newImagebase << '\n';
         }
         parseHeader32();
+        applyRelocation32();
         parseImport32();
     }
 
@@ -75,29 +79,75 @@ void parseHeader32(){
         INH32.OptionalHeader.SizeOfHeaders
     );
     int section_size = INH32.FileHeader.NumberOfSections;
+    int header_offset = IDH.e_lfanew+sizeof(INH32);
+    SourceFile.seekg(header_offset, std::ios::beg);
 
-    SourceFile.seekg(IDH.e_lfanew+sizeof(INH32), std::ios::beg);
+    int header_addr = INH32.OptionalHeader.ImageBase + header_offset;
+    std::cout << "Section Headers: " << (void*)header_addr << '\n';
 
     for(int i=0;i<section_size;++i){
-        IMAGE_SECTION_HEADER tmp_ish;
-        Util::LoadPEStructure(SourceFile, &tmp_ish, 0, false);
-        auto addr = tmp_ish.VirtualAddress + INH32.OptionalHeader.ImageBase;
-
-        std::cout << "Mapping section " << tmp_ish.Name << "\t=> " << (void*)addr << '\n';
+        IMAGE_SECTION_HEADER* ISH = (IMAGE_SECTION_HEADER*)header_addr;
+        auto dst_addr = ISH->VirtualAddress + INH32.OptionalHeader.ImageBase;
+        auto src_addr = (uintptr_t)RawData.data() + ISH->PointerToRawData;
+        std::cout << "Mapping section " << ISH->Name << "\t=> " << (void*)dst_addr << '\n';
         memcpy(
-            LPVOID(addr),
-            &tmp_ish,
-            sizeof(tmp_ish)
+            LPVOID(dst_addr),
+            LPVOID(src_addr),
+            ISH->SizeOfRawData
         );
+        header_addr += sizeof(IMAGE_SECTION_HEADER);
     }
+
+}
+
+
+void applyRelocation32(){
+    std::cout << "Apply relocation\n";
+    IMAGE_DATA_DIRECTORY reloc_dir = INH32.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    if(!reloc_dir.VirtualAddress || !reloc_dir.Size){ return ;}
+    auto reloc_addr = INH32.OptionalHeader.ImageBase + reloc_dir.VirtualAddress;
+
+    uintptr_t cur_ptr = 0;
+    uintptr_t upbound_addr = INH32.OptionalHeader.ImageBase + INH32.OptionalHeader.SizeOfImage;
+
+    while(cur_ptr < reloc_dir.Size){
+        IMAGE_BASE_RELOCATION* IBR = (IMAGE_BASE_RELOCATION*)(reloc_addr + cur_ptr);
+        uintptr_t entry_len = (IBR->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(BASE_RELOCATION_ENTRY);
+        BASE_RELOCATION_ENTRY* BRE = (BASE_RELOCATION_ENTRY*)((uintptr_t)IBR + sizeof(IMAGE_BASE_RELOCATION));
+        for(int i=0;i<entry_len;++i){
+            if(BRE == NULL){ break; }
+            auto offset = BRE->Offset;
+            auto type   = BRE->Type;
+            uintptr_t page_addr = reloc_addr + offset;
+
+            if(!offset){ break; }
+            else if(type != RELB_HIGHLOW){
+                std::cout << "Unsupported relocation at " << (void*)page_addr << " of " << type << '\n';
+                continue;
+            }
+            else if(page_addr > upbound_addr){
+                std::cout << "Relocation out of bound at " << (void*)page_addr << " of " << (void*)upbound_addr << '\n';
+                continue;
+            }
+            BRE = (BASE_RELOCATION_ENTRY*)((uintptr_t)BRE + sizeof(BASE_RELOCATION_ENTRY));
+        }
+        cur_ptr += IBR->SizeOfBlock;
+    }
+    std::cout << "Relocation done, total size: " << (void*)cur_ptr << '\n';
     Util::Pause();
 }
 
-void parseHeader64(){
+void parseImport32(){
+    std::cout << "Resolving imports\n";
+    IMAGE_DATA_DIRECTORY import_dir = INH32.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
 
 }
 
-void parseImport32(){
+void applyRelocation64(){
+
+}
+
+void parseHeader64(){
 
 }
 
