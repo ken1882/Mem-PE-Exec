@@ -5,8 +5,8 @@ namespace Util{
      * > Load a PE struct
      * @param [file] File IO stream of the PE
      * @param [strptr] Output struct
-     * @param [offset] Seek offset to the current file stream
-     * @param [rewind] Rewind the current file stream
+     * @param [offset=0] Seek offset to the current file stream
+     * @param [rewind=false] Rewind the current file stream
      */
     template<class T>
     void LoadPEStructure(std::fstream& file, T* strptr, int offset, bool rewind){
@@ -37,10 +37,12 @@ namespace Util{
     char Pause(){
         std::cout << "\n\nPress any key to continue...";
         char _ = getch();
+        std::cout << '\n' << std::endl;
     }
 
     char Pause(std::string hint){
         std::cout << hint;
         char _ = getch();
+        std::cout << '\n' << std::endl;
     }
 }

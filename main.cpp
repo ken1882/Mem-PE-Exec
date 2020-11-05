@@ -13,6 +13,7 @@ void applyRelocation32();
 void applyRelocation64();
 void parseImport32();
 void parseImport64();
+void makeX86JumpPoint(std::vector<std::pair<std::string, std::string>>&);
 
 int main(int argc, char* argv[], char** envp){
     std::string target_file = "sample/HxD_azo.exe";
@@ -42,6 +43,7 @@ int main(int argc, char* argv[], char** envp){
             std::cout << "Prefer address occupied, relocating (x64, size: " << (void*)_msize << ")\n";
             newImagebase = (QWORD)VirtualAlloc(NULL, INH64.OptionalHeader.SizeOfImage, ALLOC_TYPE, PAGE_EXECUTE_READWRITE);
             INH64.OptionalHeader.ImageBase = newImagebase;
+
             std::cout << "New image base is: " << (void*)newImagebase << '\n';
         }
         parseHeader64();
@@ -78,6 +80,13 @@ void parseHeader32(){
         RawData.data(),
         INH32.OptionalHeader.SizeOfHeaders
     );
+    DWORD* e_lfanew = (DWORD*)(INH32.OptionalHeader.ImageBase+0x3c);
+
+    // Fix imagebase location
+    uintptr_t ioh_addr = INH32.OptionalHeader.ImageBase + *e_lfanew + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER);
+    IMAGE_OPTIONAL_HEADER32* _ioh32 = (IMAGE_OPTIONAL_HEADER32*)ioh_addr;
+    _ioh32->ImageBase = INH32.OptionalHeader.ImageBase;
+
     int section_size = INH32.FileHeader.NumberOfSections;
     int header_offset = IDH.e_lfanew+sizeof(INH32);
     SourceFile.seekg(header_offset, std::ios::beg);
@@ -107,11 +116,11 @@ void applyRelocation32(){
     if(!reloc_dir.VirtualAddress || !reloc_dir.Size){ return ;}
     auto reloc_addr = INH32.OptionalHeader.ImageBase + reloc_dir.VirtualAddress;
 
-    uintptr_t cur_ptr = 0;
+    uintptr_t cur_offset = 0;
     uintptr_t upbound_addr = INH32.OptionalHeader.ImageBase + INH32.OptionalHeader.SizeOfImage;
 
-    while(cur_ptr < reloc_dir.Size){
-        IMAGE_BASE_RELOCATION* IBR = (IMAGE_BASE_RELOCATION*)(reloc_addr + cur_ptr);
+    while(cur_offset < reloc_dir.Size){
+        IMAGE_BASE_RELOCATION* IBR = (IMAGE_BASE_RELOCATION*)(reloc_addr + cur_offset);
         uintptr_t entry_len = (IBR->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(BASE_RELOCATION_ENTRY);
         BASE_RELOCATION_ENTRY* BRE = (BASE_RELOCATION_ENTRY*)((uintptr_t)IBR + sizeof(IMAGE_BASE_RELOCATION));
         for(int i=0;i<entry_len;++i){
@@ -131,16 +140,93 @@ void applyRelocation32(){
             }
             BRE = (BASE_RELOCATION_ENTRY*)((uintptr_t)BRE + sizeof(BASE_RELOCATION_ENTRY));
         }
-        cur_ptr += IBR->SizeOfBlock;
+        cur_offset += IBR->SizeOfBlock;
     }
-    std::cout << "Relocation done, total size: " << (void*)cur_ptr << '\n';
-    Util::Pause();
+    std::cout << "Relocation done, total size: " << (void*)cur_offset << '\n';
 }
 
 void parseImport32(){
     std::cout << "Resolving imports\n";
     IMAGE_DATA_DIRECTORY import_dir = INH32.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if(!import_dir.Size){
+        std::cout << "Import directory not present.\n";
+        return ;
+    }
 
+    auto import_addr = import_dir.VirtualAddress + INH32.OptionalHeader.ImageBase;
+    std::cout << "Import Directory located at: " << (void*) import_addr << " (" << (void*)import_dir.Size << ")\n";
+
+    std::vector<std::pair<std::string, std::string>> dll_functions;
+    uintptr_t cur_offset = 0;
+    uintptr_t upbound_addr = INH32.OptionalHeader.ImageBase + INH32.OptionalHeader.SizeOfImage;
+    auto delta_idesc_offset = sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    while(cur_offset < import_dir.Size){
+        IMAGE_IMPORT_DESCRIPTOR* IMD = (IMAGE_IMPORT_DESCRIPTOR*)(import_addr+cur_offset);
+
+        // Terminating flag
+        if(IMD->OriginalFirstThunk == NULL && IMD->FirstThunk == NULL){
+            break;
+        }
+
+        char* dll_name = (char*)(IMD->Name+INH32.OptionalHeader.ImageBase);
+        std::cout << "Importing: " << dll_name << '\n';
+
+        // Import Name Table and Import Address Table offset
+        auto INT_offset = IMD->FirstThunk;
+        auto IAT_offset = IMD->OriginalFirstThunk;
+        if(INT_offset == NULL){INT_offset = IAT_offset;}
+
+        uintptr_t table_offset = 0;
+        auto delta_table_offset = sizeof(IMAGE_THUNK_DATA32);
+        const auto IBASE = INH32.OptionalHeader.ImageBase;
+
+        while(true){
+            IMAGE_THUNK_DATA32* INT_THUNK32 = (IMAGE_THUNK_DATA32*)(IBASE+INT_offset+table_offset);
+            IMAGE_THUNK_DATA32* IAT_THUNK32 = (IMAGE_THUNK_DATA32*)(IBASE+IAT_offset+table_offset);
+            table_offset += delta_table_offset;
+
+            bool FLAG_IMPORT_BY_ORDINAL = IAT_THUNK32->u1.Ordinal & IMAGE_ORDINAL_FLAG32;
+            std::cout << (void*)INT_THUNK32 << ' ' << (void*)IAT_THUNK32 << '\n';
+            // Import by ordinal
+            if(FLAG_IMPORT_BY_ORDINAL){
+                auto lib_addr = LoadLibraryA(dll_name);
+                char* fname = (char*)IMAGE_ORDINAL32(IAT_THUNK32->u1.Ordinal);
+                uintptr_t faddr = (uintptr_t)GetProcAddress(lib_addr, fname);
+                INT_THUNK32->u1.Function = faddr;
+                std::cout << "Function " << fname << " loaded at " << (void*)faddr << ' ';
+                std::cout << INT_THUNK32->u1.Function << '\n';
+            }
+
+            if(INT_THUNK32->u1.Function == NULL){break;}
+
+            // Import by name
+            if(!FLAG_IMPORT_BY_ORDINAL && INT_THUNK32->u1.Function == IAT_THUNK32->u1.Function){
+                IMAGE_IMPORT_BY_NAME* IMN = (IMAGE_IMPORT_BY_NAME*)(IBASE+IAT_THUNK32->u1.AddressOfData);
+                auto fname = (char*)IMN->Name;
+                auto lib_addr = LoadLibraryA(dll_name);
+                uintptr_t faddr = (uintptr_t)GetProcAddress(lib_addr, fname);
+
+                // Function (probably) not in this library
+                if(!faddr){break;}
+                INT_THUNK32->u1.Function = faddr;
+                std::cout << "Function " << fname << " loaded at " << (void*)faddr << ' ';
+                std::cout << (void*)INT_THUNK32->u1.Function << '\n';
+            }
+        }
+        std::cout << "------------------\n";
+        cur_offset += delta_idesc_offset;
+    }
+    makeX86JumpPoint(dll_functions);
+    Util::Pause();
+}
+
+void makeX86JumpPoint(std::vector<std::pair<std::string, std::string>>& dll_functions){
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    const int SYS_PAGE_SIZE = sysInfo.dwPageSize;
+    std::cout << "System page size: " << (void*)SYS_PAGE_SIZE << '\n';
+    auto jmp_addr = VirtualAlloc(LPVOID(0xc7c95bf0), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    std::cout << (void*)jmp_addr << '\n';
 }
 
 void applyRelocation64(){
@@ -154,3 +240,7 @@ void parseHeader64(){
 void parseImport64(){
 
 }
+/*
+0x7fffc7c95bf0 0xc7c95bf0
+0x7fffc7c95cb0 0xc7c95cb0
+*/
