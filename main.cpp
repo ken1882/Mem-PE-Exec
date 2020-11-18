@@ -18,12 +18,16 @@ void applyRelocation64();
 void parseImport64();
 void parseTLS64();
 
-
 int main(int argc, char* argv[], char** envp){
     if(_FLAGX64){ std::cout << "=== Compiled for x64 mode ===\n";}
     else        { std::cout << "=== Compiled for x86 mode ===\n";}
 
-    std::string target_file = "sample/msgbox32.exe";
+    std::string target_file;
+    if(argc > 1){ target_file = argv[1]; }
+    else{
+        std::cout << "Please enter file path: ";
+        std::getline(std::cin, target_file);
+    }
     SourceFile.open(target_file, std::ios::in | std::ios::binary);
 
     Util::LoadPEStructure(SourceFile, &IDH);
@@ -68,6 +72,10 @@ int main(int argc, char* argv[], char** envp){
         if(_reloced){ applyRelocation64(); }
         parseImport64();
         parseTLS64();
+        uintptr_t entry_addr = INH64.OptionalHeader.ImageBase + INH64.OptionalHeader.AddressOfEntryPoint;
+        std::cout << "Entry addr: " << (void*)entry_addr << '\n';
+
+        ((void(*)()) entry_addr)();
     }
     else{ // x86 header
         if(!_FLAGX86){
@@ -98,6 +106,10 @@ int main(int argc, char* argv[], char** envp){
         if(_reloced){ applyRelocation32(); }
         parseImport32();
         parseTLS32();
+        uintptr_t entry_addr = INH32.OptionalHeader.ImageBase + INH32.OptionalHeader.AddressOfEntryPoint;
+        std::cout << "Entry addr: " << (void*)entry_addr << '\n';
+
+        ((void(*)()) entry_addr)();
     }
 
     SourceFile.close();
@@ -156,14 +168,17 @@ void applyRelocation32(){
         BASE_RELOCATION_ENTRY* BRE = (BASE_RELOCATION_ENTRY*)((uintptr_t)IBR + sizeof(IMAGE_BASE_RELOCATION));
 
         auto reloc_offset = INH32.OptionalHeader.ImageBase+IBR->VirtualAddress;
-
+        std::cout << "Relocation RVA: " << (void*)IBR->VirtualAddress << "; Length: " << entry_len << '\n';
         for(int i=0;i<entry_len;++i, ++BRE){
-            if(BRE == NULL){ break; }
+            if(BRE == NULL){
+                std::cout << "Null entry!\n";
+                break;
+            }
             auto offset = BRE->Offset;
             auto type   = BRE->Type;
             uintptr_t* page_addr = (uintptr_t*)(reloc_offset+offset);
 
-            if(!offset){ break; }
+            if(!type){ break; }
             else if(type != RELB_HIGHLOW){
                 std::cout << "Unsupported relocation at " << (void*)page_addr << " of " << type << '\n';
             }
@@ -260,7 +275,7 @@ void parseTLS32(){
         std::cout << "No TLS required.\n";
         return ;
     }
-    std::cout << (void*)tls_dir.VirtualAddress << '\n';
+
     auto tls_addr = tls_dir.VirtualAddress + INH32.OptionalHeader.ImageBase;
     std::cout << "TLS Directory located at: " << (void*) tls_addr << " (" << (void*)tls_dir.Size << ")\n";
     IMAGE_TLS_DIRECTORY32* ITD = (IMAGE_TLS_DIRECTORY32*)tls_addr;
@@ -268,9 +283,13 @@ void parseTLS32(){
     for(auto* it=(PIMAGE_TLS_CALLBACK*)ITD->AddressOfCallBacks; it && *it; ++it){
         std::cout << "TLS callback function: ";
         std::cout << std::hex << it << " -> " << (void*)*it << '\n';
+        (*it)(
+            (void*)INH32.OptionalHeader.ImageBase,
+            DLL_THREAD_ATTACH,
+            nullptr
+        );
+        std::cout << "TLS function called successfully\n";
     }
-
-    Util::Pause();
 }
 
 void applyRelocation64(){
