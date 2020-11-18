@@ -2,21 +2,28 @@
 #include "util.h"
 
 IMAGE_DOS_HEADER IDH;
-IMAGE_NT_HEADERS32 INH32;
-IMAGE_NT_HEADERS64 INH64;
 std::vector<char> RawData;
 std::fstream SourceFile;
+static uintptr_t OLD_IMAGEBASE = 0;
 
+IMAGE_NT_HEADERS32 INH32;
 void parseHeader32();
-void parseHeader64();
 void applyRelocation32();
-void applyRelocation64();
 void parseImport32();
+void parseTLS32();
+
+IMAGE_NT_HEADERS64 INH64;
+void parseHeader64();
+void applyRelocation64();
 void parseImport64();
-void makeX86JumpPoint(std::vector<std::pair<std::string, std::string>>&);
+void parseTLS64();
+
 
 int main(int argc, char* argv[], char** envp){
-    std::string target_file = "sample/HxD_azo.exe";
+    if(_FLAGX64){ std::cout << "=== Compiled for x64 mode ===\n";}
+    else        { std::cout << "=== Compiled for x86 mode ===\n";}
+
+    std::string target_file = "sample/msgbox32.exe";
     SourceFile.open(target_file, std::ios::in | std::ios::binary);
 
     Util::LoadPEStructure(SourceFile, &IDH);
@@ -29,44 +36,68 @@ int main(int argc, char* argv[], char** envp){
     const DWORD ALLOC_TYPE = MEM_COMMIT | MEM_RESERVE;
     RawData = Util::LoadPEBuffer(target_file.c_str());
 
+    bool _reloced = false;
     // Load x64 header
     if(IsX64PE){
+        if(!_FLAGX64){
+            std::cout << "Program is compiled for 32bits PE, cannot run x86 executables\n";
+            return 0;
+        }
         QWORD newImagebase = 0;
+        OLD_IMAGEBASE = INH64.OptionalHeader.ImageBase;
         std::cout << "Selected image is 64-bits PE\n";
         std::cout << "Image Base: " << (void*)INH64.OptionalHeader.ImageBase << '\n';
-        newImagebase = (QWORD)VirtualAlloc((LPVOID)INH64.OptionalHeader.ImageBase, INH64.OptionalHeader.SizeOfImage, ALLOC_TYPE, PAGE_EXECUTE_READWRITE);
+        newImagebase = (uintptr_t)VirtualAlloc((LPVOID)INH64.OptionalHeader.ImageBase, INH64.OptionalHeader.SizeOfImage, ALLOC_TYPE, PAGE_EXECUTE_READWRITE);
         reloc_dir = INH64.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
 
         // Relocate if reloc table available and prefer address occupied
         if(!newImagebase && reloc_dir.VirtualAddress){
             auto _msize = INH64.OptionalHeader.SizeOfImage;
             std::cout << "Prefer address occupied, relocating (x64, size: " << (void*)_msize << ")\n";
-            newImagebase = (QWORD)VirtualAlloc(NULL, INH64.OptionalHeader.SizeOfImage, ALLOC_TYPE, PAGE_EXECUTE_READWRITE);
+            newImagebase = (uintptr_t)VirtualAlloc(NULL, INH64.OptionalHeader.SizeOfImage, ALLOC_TYPE, PAGE_EXECUTE_READWRITE);
             INH64.OptionalHeader.ImageBase = newImagebase;
-
             std::cout << "New image base is: " << (void*)newImagebase << '\n';
+            _reloced = true;
         }
+        else if(!reloc_dir.VirtualAddress){
+            std::cout << "Relocation needed but no `.reloc` info available.\n";
+            return 1;
+        }
+
         parseHeader64();
-        applyRelocation64();
+        if(_reloced){ applyRelocation64(); }
         parseImport64();
+        parseTLS64();
     }
     else{ // x86 header
+        if(!_FLAGX86){
+            std::cout << "Program is compiled for 64bits PE, cannot run x64 executables\n";
+            return 0;
+        }
         DWORD newImagebase = 0;
+        OLD_IMAGEBASE = INH32.OptionalHeader.ImageBase;
         std::cout << "Selected image is 32-bits PE\n";
         std::cout << "Image Base: " << (void*)INH32.OptionalHeader.ImageBase << '\n';
-        newImagebase = (QWORD)VirtualAlloc((LPVOID)INH32.OptionalHeader.ImageBase, INH32.OptionalHeader.SizeOfImage, ALLOC_TYPE, PAGE_EXECUTE_READWRITE);
+        newImagebase = (uintptr_t)VirtualAlloc((LPVOID)INH32.OptionalHeader.ImageBase, INH32.OptionalHeader.SizeOfImage, ALLOC_TYPE, PAGE_EXECUTE_READWRITE);
         reloc_dir = INH32.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
 
         if(!newImagebase && reloc_dir.VirtualAddress){
             auto _msize = INH32.OptionalHeader.SizeOfImage;
             std::cout << "Prefer address occupied, relocating (x86, size: " << (void*)_msize << ")\n";
-            newImagebase = (QWORD)VirtualAlloc(NULL, _msize, ALLOC_TYPE, PAGE_EXECUTE_READWRITE);
+            newImagebase = (uintptr_t)VirtualAlloc(NULL, _msize, ALLOC_TYPE, PAGE_EXECUTE_READWRITE);
             INH32.OptionalHeader.ImageBase = newImagebase;
             std::cout << "New image base is: " << (void*)newImagebase << '\n';
+            _reloced = true;
         }
+        else if(!reloc_dir.VirtualAddress){
+            std::cout << "Relocation needed but no `.reloc` info available.\n";
+            return 1;
+        }
+
         parseHeader32();
-        applyRelocation32();
+        if(_reloced){ applyRelocation32(); }
         parseImport32();
+        parseTLS32();
     }
 
     SourceFile.close();
@@ -114,31 +145,35 @@ void applyRelocation32(){
     std::cout << "Apply relocation\n";
     IMAGE_DATA_DIRECTORY reloc_dir = INH32.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if(!reloc_dir.VirtualAddress || !reloc_dir.Size){ return ;}
-    auto reloc_addr = INH32.OptionalHeader.ImageBase + reloc_dir.VirtualAddress;
 
     uintptr_t cur_offset = 0;
     uintptr_t upbound_addr = INH32.OptionalHeader.ImageBase + INH32.OptionalHeader.SizeOfImage;
+    auto reloc_delta = INH32.OptionalHeader.ImageBase - OLD_IMAGEBASE;
 
     while(cur_offset < reloc_dir.Size){
-        IMAGE_BASE_RELOCATION* IBR = (IMAGE_BASE_RELOCATION*)(reloc_addr + cur_offset);
+        IMAGE_BASE_RELOCATION* IBR = (IMAGE_BASE_RELOCATION*)(INH32.OptionalHeader.ImageBase + reloc_dir.VirtualAddress + cur_offset);
         uintptr_t entry_len = (IBR->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(BASE_RELOCATION_ENTRY);
         BASE_RELOCATION_ENTRY* BRE = (BASE_RELOCATION_ENTRY*)((uintptr_t)IBR + sizeof(IMAGE_BASE_RELOCATION));
-        for(int i=0;i<entry_len;++i){
+
+        auto reloc_offset = INH32.OptionalHeader.ImageBase+IBR->VirtualAddress;
+
+        for(int i=0;i<entry_len;++i, ++BRE){
             if(BRE == NULL){ break; }
             auto offset = BRE->Offset;
             auto type   = BRE->Type;
-            uintptr_t page_addr = reloc_addr + offset;
+            uintptr_t* page_addr = (uintptr_t*)(reloc_offset+offset);
 
             if(!offset){ break; }
             else if(type != RELB_HIGHLOW){
                 std::cout << "Unsupported relocation at " << (void*)page_addr << " of " << type << '\n';
-                continue;
             }
-            else if(page_addr > upbound_addr){
+            else if((uintptr_t)page_addr > upbound_addr){
                 std::cout << "Relocation out of bound at " << (void*)page_addr << " of " << (void*)upbound_addr << '\n';
-                continue;
             }
-            BRE = (BASE_RELOCATION_ENTRY*)((uintptr_t)BRE + sizeof(BASE_RELOCATION_ENTRY));
+            else{
+                *page_addr += reloc_delta;
+                std::cout << (void*)page_addr << " relocate OK\n";
+            }
         }
         cur_offset += IBR->SizeOfBlock;
     }
@@ -216,17 +251,26 @@ void parseImport32(){
         std::cout << "------------------\n";
         cur_offset += delta_idesc_offset;
     }
-    makeX86JumpPoint(dll_functions);
-    Util::Pause();
 }
 
-void makeX86JumpPoint(std::vector<std::pair<std::string, std::string>>& dll_functions){
-    SYSTEM_INFO sysInfo;
-    GetSystemInfo(&sysInfo);
-    const int SYS_PAGE_SIZE = sysInfo.dwPageSize;
-    std::cout << "System page size: " << (void*)SYS_PAGE_SIZE << '\n';
-    auto jmp_addr = VirtualAlloc(LPVOID(0xc7c95bf0), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    std::cout << (void*)jmp_addr << '\n';
+void parseTLS32(){
+    std::cout << "Resolving TLS\n";
+    IMAGE_DATA_DIRECTORY tls_dir = INH32.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if(!tls_dir.Size){
+        std::cout << "No TLS required.\n";
+        return ;
+    }
+    std::cout << (void*)tls_dir.VirtualAddress << '\n';
+    auto tls_addr = tls_dir.VirtualAddress + INH32.OptionalHeader.ImageBase;
+    std::cout << "TLS Directory located at: " << (void*) tls_addr << " (" << (void*)tls_dir.Size << ")\n";
+    IMAGE_TLS_DIRECTORY32* ITD = (IMAGE_TLS_DIRECTORY32*)tls_addr;
+
+    for(auto* it=(PIMAGE_TLS_CALLBACK*)ITD->AddressOfCallBacks; it && *it; ++it){
+        std::cout << "TLS callback function: ";
+        std::cout << std::hex << it << " -> " << (void*)*it << '\n';
+    }
+
+    Util::Pause();
 }
 
 void applyRelocation64(){
@@ -240,7 +284,7 @@ void parseHeader64(){
 void parseImport64(){
 
 }
-/*
-0x7fffc7c95bf0 0xc7c95bf0
-0x7fffc7c95cb0 0xc7c95cb0
-*/
+
+void parseTLS64(){
+
+}

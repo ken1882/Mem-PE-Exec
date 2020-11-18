@@ -33,7 +33,16 @@ typedef struct _BASE_RELOCATION_ENTRY {
 } BASE_RELOCATION_ENTRY;
 
 extern IMAGE_DOS_HEADER IDH;
+
 extern IMAGE_NT_HEADERS32 INH32;
 extern IMAGE_NT_HEADERS64 INH64;
+
+#ifndef _WIN64
+#define _FLAGX64 0
+#define _FLAGX86 1
+#else
+#define _FLAGX64 1
+#define _FLAGX86 0
+#endif // _WIN64
 
 #endif // INCLUDE_MPEE_MAIN
